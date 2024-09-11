@@ -69,9 +69,89 @@ public class ChunkedListTests
             chunkedList.Add(new TestData("Name", i));
         }
 
-        Assert.True(chunkedList.Count == 20_000);
+        Assert.Equal(20_000, chunkedList.Count);
     }
 
+    [Fact]
+    public void GivenAnItemAddedIncreaseCount()
+    {
+        var testItem = new TestData("First Item", 1);
+        ChunkedList<TestData> chunkedList = [];
+
+        chunkedList.Add(testItem);
+
+        Assert.Single(chunkedList);
+    }
+
+    [Fact]
+    public void EnumeratorReturnsValuesCorrectly()
+    {
+        var list = new ChunkedList<int>(4)
+        {
+            1,
+            2
+        };
+
+        using var enumerator = list.GetEnumerator();
+        Assert.True(enumerator.MoveNext());
+        Assert.Equal(1, enumerator.Current);
+        Assert.True(enumerator.MoveNext());
+        Assert.Equal(2, enumerator.Current);
+        Assert.False(enumerator.MoveNext());
+    }
+
+    [Fact]
+    public void CanClearList()
+    {
+        var list = new ChunkedList<int>(4)
+        {
+            1,
+            2
+        };
+
+        list.Clear();
+
+        Assert.Empty(list);
+        Assert.True(list.Count == 0);
+    }
+
+    [Fact]
+    public void DefaultSortOrdersCorrectly()
+    {
+        var list = new ChunkedList<int>(4)
+        {
+            4,
+            5,
+            1,
+            8
+        };
+
+        list.Sort();
+
+        Assert.Equal(1, list[0]);
+        Assert.Equal(4, list[1]);
+        Assert.Equal(5, list[2]);
+        Assert.Equal(8, list[3]);
+    }
+
+    [Fact]
+    public void RandomizedNumbersSortedCorrectly()
+    {
+        const int initialCount = 100_000;
+        const int chunkByteSize = 5;
+        var random = new Random();
+        for(var count = initialCount; count < initialCount + (1 << chunkByteSize); count++)
+        {
+            var list = new ChunkedList<int>(5);
+            for(var i = 0; i < count; i++)
+                list.Add(random.Next(0, 10_000));
+            
+            list.Sort();
+
+            for(var i = 1; i < list.Count; i++)
+                Assert.True(list[i-1] <= list[i]);
+        }
+    }
 
     private sealed record TestData(string Name, int Value);
 }

@@ -12,7 +12,7 @@ public static class ChunkedList
     {
         if (source.Length == 0)
         {
-            return equalityComparer is null || ReferenceEquals(equalityComparer, ChunkedList<T>.Empty.Comparer) ? ChunkedList<T>.Empty : new EmptyChunkedList<T>(equalityComparer);
+            return equalityComparer is null || ReferenceEquals(equalityComparer, ChunkedList<T>.Empty.Comparer) ? new ChunkedList<T>(4) : new ChunkedList<T>(4, 0, equalityComparer);
         }
 
         var list = new ChunkedList<T>(4, 0, equalityComparer ?? EqualityComparer<T>.Default);
@@ -44,7 +44,7 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
     private int _nextChunkIndex;
     private int _nextIndexInChunk;
 
-    public ChunkedList(byte chunkByteSize, int initialCapacity)
+    public ChunkedList(byte chunkByteSize, int initialCapacity = default)
         : this(chunkByteSize, initialCapacity, EqualityComparer<T>.Default) {}
     public ChunkedList(byte chunkByteSize, int initialCapacity, IEqualityComparer<T> comparer)
     {
@@ -56,7 +56,7 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
         _chunks = initialCapacity == 0 ? [] : new T?[]?[GetChunkCount(initialCapacity, chunkByteSize)];
     }
 
-    public ChunkedList(IEnumerable<T> collection, byte chunkByteSize, int initialCapacity, IEqualityComparer<T>? comparer = default) 
+    public ChunkedList(IEnumerable<T> collection, byte chunkByteSize, int initialCapacity = default, IEqualityComparer<T>? comparer = default) 
         : this(chunkByteSize, initialCapacity, comparer ?? EqualityComparer<T>.Default)
     {
         Debug.Assert(collection != null);
@@ -68,7 +68,7 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
         }
     }
 
-    protected ChunkedList(byte chunkByteSize, int initialCapacity, bool readOnly, IEqualityComparer<T>? equalityComparer = null) 
+    protected ChunkedList(byte chunkByteSize, int initialCapacity, bool readOnly = true, IEqualityComparer<T>? equalityComparer = null) 
         : this(chunkByteSize, initialCapacity, equalityComparer ?? EqualityComparer<T>.Default)
     {
         IsReadOnly = readOnly;
@@ -86,7 +86,7 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
         set
         {
             GetAtIndex(index) = value;
-            Interlocked.Increment(ref _version);
+            _version++;
         }
     }
 
@@ -103,7 +103,7 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
             try
             {
                 GetAtIndex(index) = (T)value;
-                Interlocked.Increment(ref _version);
+                _version++;
             }
             catch (InvalidCastException)
             {
@@ -211,6 +211,9 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
 
     public void RemoveAt(int index) => RemoveAtIndexCore(index);
 
+    public void Sort() => Sort<IComparer<T>>(null);
+    public void Sort(Comparison<T> comparison) => Sort(Comparer<T>.Create(comparison));
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private protected void AddItemCore(T item)
     {
@@ -223,13 +226,13 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
         var chunk = _chunks[chunkIndex] ??= new T[_chunkSize];
         chunk[indexInChunk] = item;
 
-        Interlocked.Increment(ref _count);
-        Interlocked.Increment(ref _version);
-        Interlocked.Increment(ref _nextIndexInChunk);
+        _count++;
+        _version++;
+        _nextIndexInChunk++;
         if(_nextIndexInChunk == _chunkSize)
         {
             _nextIndexInChunk = 0;
-            Interlocked.Increment(ref _nextChunkIndex);
+            _nextChunkIndex++;
         }
     }
 
@@ -251,7 +254,7 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
         _count = 0;
         _nextChunkIndex = 0;
         _nextIndexInChunk = 0;
-        Interlocked.Increment(ref _version);
+        _version++;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -375,6 +378,61 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
 
     private protected virtual int CountCore => _count;
 
+    private protected virtual void Sort<TComparer>(TComparer? comparer)
+        where TComparer : IComparer<T>?
+    {
+        if(Count <= 1)        
+            return;
+
+        var chunkCount = GetChunkCount(Count, _chunkByteSize);
+        var lastChunkSize = ((Count - 1) & _indexInChunkMask) + 1;
+        if(chunkCount == 1)
+        {
+            SortChunk(_chunks[0]!.AsSpan(0, lastChunkSize)!, comparer);
+            return;
+        }
+
+        var chunks = new Memory<T>[chunkCount];
+        for(var i = 0; i < chunkCount - 1; i++)
+        {
+            chunks[i] = _chunks[i]!.AsMemory()!;
+            _chunks[i] = new T[_chunkSize];
+        }
+
+        chunks[^1] = _chunks[chunkCount - 1]!.AsMemory(0, lastChunkSize)!;
+        _chunks[chunkCount -1] = new T[_chunkSize];
+        _count = 0;
+        _nextChunkIndex = 0;
+        _nextIndexInChunk = 0;
+        _version++;
+
+        foreach(var chunk in chunks)
+            SortChunk(chunk.Span, comparer);
+
+        var sortedItems = new PriorityQueue<int, T>(chunkCount, comparer);
+        for(var i = 0; i < chunkCount; i++)
+            sortedItems.Enqueue(i << _chunkByteSize, chunks[i].Span[0]);
+        
+        while(sortedItems.TryDequeue(out var index, out var item))
+        {
+            Add(item);
+
+            var chunkIndex = index >> _chunkByteSize;
+            var nextIndexInChunk = (index & _indexInChunkMask) + 1;
+            var chunk = chunks[chunkIndex].Span;
+            if(nextIndexInChunk < chunk.Length)
+                sortedItems.Enqueue(index + 1, chunk[nextIndexInChunk]);
+        }
+
+        static void SortChunk(Span<T> chunk, TComparer? comparer)
+        {
+            if(comparer is null)
+                chunk.Sort();
+            else
+                chunk.Sort(comparer);
+        }
+    }
+
     private protected virtual int FindItemIndex(T item)
     {
         Debug.Assert(item is not null);
@@ -422,11 +480,13 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
         public bool MoveNext()
         {
             CheckVersion();
-            
-            if(_index++ >= _count)
+
+            _index++;
+            if(_index >= _count)
                 return false;
             
-            if(_indexInChunk++ == _chunkSize)
+            _indexInChunk++;
+            if(_indexInChunk == _chunkSize)
             {
                 _indexInChunk = 0;
                 _currentChunk = _chunks[_chunkIndex++];
