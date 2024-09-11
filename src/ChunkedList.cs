@@ -2,6 +2,8 @@
 using System.Runtime.CompilerServices;
 using System.Collections;
 using System.Diagnostics.Contracts;
+using System.Diagnostics.CodeAnalysis;
+using System.Runtime.InteropServices;
 
 namespace ChunkedList;
 
@@ -17,7 +19,7 @@ public static class ChunkedList
 
         var list = new ChunkedList<T>(equalityComparer ?? EqualityComparer<T>.Default);
 
-        foreach(var item in source)
+        foreach (var item in source)
         {
             list.Add(item);
         }
@@ -34,7 +36,7 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
 {
     private const int ChunkSize = 8192;
     private const int InitialChunkSize = 4;
-    private List<List<T>> _chunks = [];
+    private readonly List<List<T>> _chunks = [];
 
     [ContractPublicPropertyName(nameof(Count))]
     private int _count;
@@ -283,29 +285,73 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private protected virtual void InsertAtCore(int index, T item)
     {
-        if (index >= 0 && index < _count)
+        if (index < 0 || index > Count)
         {
             throw new ArgumentOutOfRangeException(nameof(index));
         }
 
-        using var enumerator = GetEnumerator();
-        var newChunkedList = new ChunkedList<T>(Comparer);
-        var currentIndex = 0;
+        var chunkBucket = Count / ChunkSize;
+        var bucketIndex = Count % ChunkSize;
 
-        while (enumerator.MoveNext())
+        if (bucketIndex == 0)
         {
-            if (currentIndex == index)
-            {
-                newChunkedList.Add(item);
-            }
-
-            newChunkedList.Add(enumerator.Current);
-            currentIndex++;
+            _chunks.Add(new List<T>((chunkBucket == 0) ? InitialChunkSize : ChunkSize));
         }
 
-        _chunks = newChunkedList._chunks;
-        _count = newChunkedList._count;
+        // Move elements to make room
+        int targetChunk = index / ChunkSize;
+        int indexInTargetChunk = index % ChunkSize;
+        int chunkContainingLastElement = (Count - 1) / ChunkSize;
+        int chunkContainingFirstUnusedSlot = chunkBucket;
+        for (int i = chunkContainingLastElement; i >= targetChunk; i--)
+        {
+            var chunk = _chunks[i];
+
+            // Find chunk size
+            int thisChunkSize = ChunkSize;
+            if (i == chunkContainingFirstUnusedSlot)
+            {
+                // Chunk is not full.
+                thisChunkSize = Count % ChunkSize;
+            }
+            else
+            {
+                // Full chunk. Move last element in chunk to next chunk
+                _chunks[i + 1][0] = chunk[ChunkSize - 1];
+            }
+
+            // Move rest of the elements in chunk one position forward
+            int srcPos = 0;
+            if (i == targetChunk)
+                srcPos = indexInTargetChunk;
+            int length = thisChunkSize - srcPos - (i == chunkContainingFirstUnusedSlot ? 0 : 1);
+            if (length > 0)
+                ListCopy(chunk, srcPos, chunk, srcPos + 1, length);
+        }
+
+        // Finally, set the element and increment the list size
+        _chunks[targetChunk][indexInTargetChunk] = item;
+
+        Interlocked.Increment(ref _count);
         Interlocked.Increment(ref _version);
+    }
+
+    private static void ListCopy(List<T> srcList, int srcPosition, List<T> destList, int destPosition, int length)
+    {
+        for (var i = 0; i < length; i++)
+        {
+            var itemToCopy = srcList[srcPosition + i];
+            var indexToPush = destPosition + i;
+
+            if (indexToPush >= destList.Count)
+            {
+                destList.Add(itemToCopy);
+            }
+            else
+            {
+                destList[indexToPush] = itemToCopy;
+            }
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -324,23 +370,39 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
     {
         Debug.Assert(index >= 0 && index < Count);
 
-        using var enumerator = GetEnumerator();
-        var currentIndex = 0;
-        var newChunkedList = new ChunkedList<T>(Comparer);
-        while (enumerator.MoveNext())
+        var chunkBucket = index / ChunkSize;
+        var bucketIndex = index % ChunkSize;
+        var bucketContainingLastElement = (Count - 1) / ChunkSize;
+        var bucketContainingFirstUnusedSlot = Count / ChunkSize;
+
+        for (var i = chunkBucket; i <= bucketContainingLastElement; i++)
         {
-            if (currentIndex == index)
+            var chunk = _chunks[i];
+            var currentChunkSize = ChunkSize;
+            if (i == bucketContainingFirstUnusedSlot)
             {
-                continue;
+                // bucket is not full
+                currentChunkSize = Count % ChunkSize;
             }
 
-            newChunkedList.Add(enumerator.Current);
-            currentIndex++;
+            var srcPosition = 1;
+            if (i == chunkBucket)
+                srcPosition = bucketIndex + 1;
+
+            var length = currentChunkSize - srcPosition;
+            if (length > 0)
+            {
+                ListCopy(chunk, srcPosition, chunk, srcPosition - 1, length);
+            }
+
+            if (i != bucketContainingLastElement)
+            {
+                chunk[ChunkSize - 1] = _chunks[i + 1][0];
+            }
         }
 
-        _chunks = newChunkedList._chunks;
+        Interlocked.Decrement(ref _count);
         Interlocked.Increment(ref _version);
-        _count = newChunkedList._count;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -349,29 +411,15 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
         if (value is null)
             return false;
 
-        using var enumerator = GetEnumerator();
-        var newChunkedList = new ChunkedList<T>(Comparer);
-        var wasFound = false;
-        while (enumerator.MoveNext())
-        {
-            if (Comparer.Equals(enumerator.Current, value))
-            {
-                wasFound = true;
-                continue;
-            }
-
-            newChunkedList.Add(enumerator.Current);
-        }
+        var currentIndex = FindItemIndex(value);
+        var wasFound = currentIndex >= 0;
 
         if (!wasFound)
         {
             return false;
         }
 
-        _chunks = newChunkedList._chunks;
-        Interlocked.Increment(ref _version);
-        _count = newChunkedList.Count;
-
+        RemoveAtIndexCore(currentIndex);
         return true;
     }
 
@@ -418,9 +466,7 @@ public class ChunkedList<T> : IList<T>, IReadOnlyList<T>, IList
             {
                 if (_index == 0 || _index == _list.Count + 1)
                 {
-#pragma warning disable CA2201
                     throw new IndexOutOfRangeException($"{nameof(_index)} was out of range");
-#pragma warning restore CA2201
                 }
 
                 return Current!;
